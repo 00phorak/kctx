@@ -1,98 +1,184 @@
-use std::io::{stdout, Result};
-
 use crossterm::{
-    event::{self, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode},
+    execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    ExecutableCommand,
 };
 use ratatui::{
-    layout::Constraint,
-    prelude::CrosstermBackend,
-    style::Stylize,
-    text::Line,
-    widgets::{Cell, Row, Table, TableState},
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Modifier, Style},
+    widgets::{Block, Borders, List, ListItem},
     Terminal,
 };
+use std::{error::Error, io, fs};
+use kube::config::Kubeconfig;
 
-fn main() -> Result<()> {
-    stdout().execute(EnterAlternateScreen)?;
-    enable_raw_mode()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-    terminal.clear()?;
+#[derive(Clone)]
+struct KubeContext {
+    name: String,
+    cluster: Option<String>,
+    user: Option<String>,
+}
 
-    // let mut contexts: Vec<Line> = vec![];
-    let config = kube::config::Kubeconfig::read().unwrap();
-    let current_context = match &config.current_context {
-        Some(cc) => String::from(cc),
-        None => String::from(""),
-    };
-    let header = Row::new(vec![
-        Cell::from("Current Context").bold(),
-        Cell::from("Name").bold(),
-        Cell::from("Cluster").bold(),
-        Cell::from("Username").bold(),
-    ]);
-    let widths = [
-        Constraint::Percentage(5),
-        Constraint::Percentage(35),
-        Constraint::Percentage(35),
-        Constraint::Percentage(25),
-    ];
-    // block
-    let rows: Vec<Row> = config
-        .contexts
-        .iter()
-        .map(|x| {
-            let x = x.to_owned();
-            let context = x.context.unwrap();
-            let current = if x.name == current_context {
-                String::from("*")
-            } else {
-                String::from("")
-            };
-            let line = Row::new(vec![
-                current,
-                String::from(x.name),
-                String::from(context.cluster),
-                String::from(context.user.unwrap()),
-            ]);
-            line
+struct App {
+    contexts: Vec<KubeContext>,
+    current_context: String,
+    selected_index: usize,
+    config_path: String,
+}
+
+impl App {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        let config_path = std::env::var("KUBECONFIG").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            format!("{}/.kube/config", home)
+        });
+
+        let (contexts, current_context) = get_kubernetes_contexts(&config_path)?;
+        
+        Ok(App {
+            contexts,
+            current_context,
+            selected_index: 0,
+            config_path,
         })
-        .collect();
+    }
 
-    let table = Table::new(rows, widths).header(header).column_spacing(1);
-    let _line = Line::from(vec!["hello".red(), " ".into(), "world".red().bold()]);
-    let mut table_state = TableState::default();
-    table_state.select(Some(3)); // select the forth row (0-indexed)
+    fn next(&mut self) {
+        self.selected_index = (self.selected_index + 1) % self.contexts.len();
+    }
+
+    fn previous(&mut self) {
+        if self.selected_index > 0 {
+            self.selected_index -= 1;
+        } else {
+            self.selected_index = self.contexts.len() - 1;
+        }
+    }
+}
+
+fn get_kubernetes_contexts(config_path: &str) -> Result<(Vec<KubeContext>, String), Box<dyn Error>> {
+    let kube_config = fs::read_to_string(config_path)?;
+    let config: Kubeconfig = serde_yaml::from_str(&kube_config)?;
+    
+    let current_context = config.current_context.unwrap_or_default();
+    
+    let contexts: Vec<KubeContext> = config.contexts.iter().map(|ctx| {
+        KubeContext {
+            name: ctx.name.clone(),
+            cluster: ctx.context.as_ref().map(|c| c.cluster.clone()),
+            user: ctx.context.as_ref().and_then(|c| c.user.clone()),
+        }
+    }).collect();
+
+    Ok((contexts, current_context))
+}
+
+fn set_kubernetes_context(config_path: &str, context_name: &str) -> Result<(), Box<dyn Error>> {
+    let kube_config = fs::read_to_string(config_path)?;
+    let mut config: Kubeconfig = serde_yaml::from_str(&kube_config)?;
+    
+    config.current_context = Some(context_name.to_string());
+    
+    let new_config = serde_yaml::to_string(&config)?;
+    fs::write(config_path, new_config)?;
+    
+    Ok(())
+}
+
+fn run_app() -> Result<(), Box<dyn Error>> {
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Create app state
+    let mut app = App::new()?;
 
     loop {
-        terminal.draw(|frame| {
-            let area = frame.size();
-            frame.render_stateful_widget(
-                // Paragraph::new("Hello Ratatui! (press 'q' to quit)")
-                // Paragraph::new(contexts.clone())
-                //     .block(
-                //         Block::new()
-                //             .title("Choose K8s Context")
-                //             .borders(Borders::ALL),
-                //     )
-                //     .alignment(ratatui::prelude::Alignment::Center)
-                //     .wrap(Wrap { trim: true }),
-                table.clone(),
-                area,
-                &mut table_state,
+        terminal.draw(|f| {
+            let size = f.area();
+            
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(2)
+                .constraints([
+                    Constraint::Min(0),     // Context list with headers
+                ].as_ref())
+                .split(size);
+
+            // Create header as the first list item
+            let header = ListItem::new(
+                format!(
+                    "    {:<30} │ {:<30} │ {:<30}",
+                    "CONTEXT", "CLUSTER", "USER"
+                )
+            ).style(Style::default().add_modifier(Modifier::BOLD));
+
+            // Create the context items
+            let mut items = vec![header];
+            items.extend(app
+                .contexts
+                .iter()
+                .map(|context| {
+                    let current_marker = if context.name == app.current_context { "(*)" } else { "   " };
+                    let display_text = format!(
+                        "{} {:<30} │ {:<30} │ {:<30}",
+                        current_marker,
+                        truncate_str(&context.name, 30),
+                        truncate_str(context.cluster.as_deref().unwrap_or("-"), 30),
+                        truncate_str(context.user.as_deref().unwrap_or("-"), 30)
+                    );
+                    ListItem::new(display_text)
+                }));
+
+            let list = List::new(items)
+                .block(Block::default()
+                    .title("Kubernetes Contexts (Press 'q' to quit, ↑/↓ or j/k to navigate, Enter to select)")
+                    .borders(Borders::ALL))
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+                .highlight_symbol("► ");
+
+            f.render_stateful_widget(
+                list, 
+                chunks[0], 
+                &mut ratatui::widgets::ListState::default().with_selected(Some(app.selected_index.saturating_add(1)))
             );
         })?;
-        if event::poll(std::time::Duration::from_millis(16))? {
-            if let event::Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
+
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Char('j') | KeyCode::Down => app.next(),
+                KeyCode::Char('k') | KeyCode::Up => app.previous(),
+                KeyCode::Enter => {
+                    let selected_context = &app.contexts[app.selected_index];
+                    set_kubernetes_context(&app.config_path, &selected_context.name)?;
+                    app.current_context = selected_context.name.clone();
                     break;
                 }
+                _ => {}
             }
         }
     }
 
-    stdout().execute(LeaveAlternateScreen)?;
+    // Restore terminal
     disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    run_app()?;
+    Ok(())
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() > max_len {
+        format!("{}…", &s[..max_len - 1])
+    } else {
+        s.to_string()
+    }
 }
