@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: app-linux-amd64
+            extension: ''
+          - os: windows-latest
+            artifact_name: app-windows-amd64
+            extension: '.exe'
+          - os: macos-latest
+            artifact_name: app-macos-amd64
+            extension: ''
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Get package name
+        shell: bash
+        run: |
+          echo "PACKAGE_NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')" >> $GITHUB_ENV
+
+      - name: Build binary
+        run: cargo build --release
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            mv target/release/${{ env.PACKAGE_NAME }}.exe ${{ matrix.artifact_name }}${{ matrix.extension }}
+          else
+            mv target/release/${{ env.PACKAGE_NAME }} ${{ matrix.artifact_name }}${{ matrix.extension }}
+          fi
+
+      - name: Upload binary to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: ${{ matrix.artifact_name }}${{ matrix.extension }}
+          asset_name: ${{ matrix.artifact_name }}${{ matrix.extension }}
+          tag: ${{ github.ref }}
+          overwrite: true
